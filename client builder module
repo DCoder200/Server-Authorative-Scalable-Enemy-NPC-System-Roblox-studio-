@@ -1,0 +1,355 @@
+-- modulescript inside starter player scripts
+-- requires the npc models folder in replicated storage along with npc models
+-- depends on the npcManager module to send data to the client
+
+-- player variables
+local player = game.Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:FindFirstChild("Humanoid")
+local root = character:WaitForChild("HumanoidRootPart")
+
+-- detect respawns and reset variables
+player.CharacterAdded:Connect(function(character)
+	character = character
+	humanoid = character:WaitForChild("Humanoid")
+	root = character:WaitForChild("HumanoidRootPart")
+end)
+
+-- create a folder to store the npc models
+local localNPCs = Instance.new("Folder")
+localNPCs.Name = "localNPCs"
+localNPCs.Parent = workspace
+
+-- services
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+-- reusable tween info
+local tweenInfo = TweenInfo.new(0.75, Enum.EasingStyle.Quad, Enum.EasingDirection.Out) -- 0.75 is the sweetspot without things getting jittery or being too slow
+
+-- models folders
+local npcModels = game.ReplicatedStorage:WaitForChild("npcModels")
+local toolModels = game.ReplicatedStorage:WaitForChild("toolModels")
+
+-- remotes
+local npcUpdates = game.ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("npcUpdates")
+
+-- grab animation objects, wait for each because they could spawn in later than the script runs
+local idleAnim = script:WaitForChild("idle"):WaitForChild("idleAnim")
+local walkAnim = script:WaitForChild("walk"):WaitForChild("walkAnim")
+local jumpAnim = script:WaitForChild("jump"):WaitForChild("jumpAnim")
+local fallAnim = script:WaitForChild("fall"):WaitForChild("fallAnim")
+
+-- function to assign npc character to each numeric id
+local currentNpcData = {}
+local characters = {}
+local function createCharacter(id)
+	if characters[id] then return end
+		
+	-- clone models based on name provided by server
+	local npcModel
+	local toolName
+	for _, data in pairs(currentNpcData) do
+		if data.id == id then
+			npcModel = npcModels:WaitForChild(data.modelName)
+			toolName = data.toolName
+			break
+		end
+	end
+	
+	local character = npcModel:Clone()
+	local root = character:WaitForChild("HumanoidRootPart")
+	
+	-- insert humanoid and animator 
+	local humanoid = Instance.new("Humanoid")
+	humanoid.Parent = character
+
+	local animator = Instance.new("Animator")
+	animator.Parent = humanoid
+	
+	-- tool equip logic
+	local toolIdleTrack = nil
+	local toolActiveTrack = nil
+	
+	-- setup tool
+	if toolName then
+		local toolModel = toolModels:FindFirstChild(toolName)
+		local tool = toolModel:Clone()
+		local handle = tool.Handle
+		local grip = handle.gripAttachment
+		local rightHandGrip = root.root.torso_lower.torso_upper:FindFirstChild("upper_arm.R"):FindFirstChild("lower_arm.R").RightGripAttachment
+		
+		-- use a rigid constraint to attach the tool to the attachment
+		local constraint = Instance.new("RigidConstraint")
+		constraint.Attachment0 = grip
+		constraint.Attachment1 = rightHandGrip
+		constraint.Parent = handle
+		tool.Parent = character
+		
+		-- animations
+		local idle = tool.idle.idleAnim
+		local active = tool.active.activeAnim
+
+		-- load animation tracks
+		toolIdleTrack = animator:LoadAnimation(idle)
+		toolActiveTrack = animator:LoadAnimation(active)
+		
+		-- play tool idle immediately, no reason not to since npcs won't ever unequip tools
+		toolIdleTrack:Play()
+		toolActiveTrack:Play() -- play active once too, seems to not work later unless played here once
+	end
+	
+	character.Parent = localNPCs
+
+	-- load tracks onto animator
+	local tracks = {
+		idleTrack = animator:LoadAnimation(idleAnim),
+		walkTrack = animator:LoadAnimation(walkAnim),
+		jumpTrack = animator:LoadAnimation(jumpAnim),
+		fallTrack = animator:LoadAnimation(fallAnim),
+		
+		-- tool related
+		toolIdleTrack = toolIdleTrack,
+		toolActiveTrack = toolActiveTrack,
+	}
+
+	-- setup an id based dictionary for the npc data
+	characters[id] = {
+		character = character,
+		root = root,
+		humanoid = humanoid,
+		animator = animator,
+		tracks = tracks,
+		currentTrack = nil,
+		nextTrack = nil,
+		allowedJump = nil,
+		lastAttackCount = 0, -- keep track of attack count to determine if npc is attacking
+
+		-- store functions 
+		trackConflicts = function(track)
+			if track == tracks.walkTrack or track == tracks.idleTrack then
+				if tracks.jumpTrack.IsPlaying then return true end
+				if tracks.fallTrack.IsPlaying then return true end
+			end
+		end,
+
+		stopIdle = function()
+			if tracks.idleTrack.IsPlaying then
+				tracks.idleTrack:Stop()
+			end
+		end,
+
+		stopWalk = function()
+			if tracks.walkTrack.IsPlaying then
+				tracks.walkTrack:Stop()
+			end
+		end
+	}
+
+	-- play fall track any time jump track finishes
+	characters[id].tracks.jumpTrack.Stopped:Connect(function()
+		characters[id].allowedJump = true
+	end)
+
+	-- detect if jump starts playing
+	characters[id].humanoid.AnimationPlayed:Connect(function(track)
+		if track.Animation == jumpAnim then
+			characters[id].allowedJump = false
+		end
+	end)
+end
+
+-- listen for npc updates
+npcUpdates.OnClientEvent:Connect(function(dataIn)
+	currentNpcData = dataIn
+	
+	-- go through each id and update destination and create characters if needed
+	for _, data in pairs(currentNpcData) do
+		local id = data.id
+		
+		-- create a character if it doesn't exist
+		if not characters[id] then
+			createCharacter(id)
+		end
+
+		-- set a destination to the given position, increase it slightly based on velocity over 1/3 of a second
+		local destination = data.position + data.velocity * 0.25
+
+		-- tween just the position, we will move the CFrame to this position in renderstepped and apply a look-at at the same time
+		local tween = TweenService:Create(characters[id].root, tweenInfo, 
+			{Position = Vector3.new(
+				destination.X, 
+				(destination.Y + 2.3), -- offset Y so NPC is at the right altitude relative to the position
+				destination.Z)})
+		tween:Play()
+	end
+end)
+
+-- function to get rid of npcs that become too far away
+local removalDebounce = 0
+local function removeDistant()
+	if tick() - removalDebounce <= 1 then return end -- debounce removals
+	removalDebounce = tick()
+
+	for id, _ in pairs(characters) do
+		if not characters[id].character then continue end -- make sure character exists
+		if not characters[id].root then continue end -- make sure root exists
+
+		-- get distance between olayer and npc
+		local distance = (root.Position - characters[id].root.Position).Magnitude
+		if distance >= 100 then
+			characters[id].character.Parent = nil
+
+		else -- reparent if close enough
+			if distance <= 70 then
+				characters[id].character.Parent = localNPCs
+			end
+		end
+	end
+end
+
+-- function to clear dead npcs
+local function clearDead(deadIDs)
+	for _, id in pairs(deadIDs) do
+		
+		-- create shallow copy of character entry
+		local entry = characters[id]
+		if entry and entry.character then
+			entry.character:Destroy()
+		end
+		
+		-- clear data after destruction
+		characters[id] = nil
+	end
+end
+
+-- module functions
+local npcsClient = {}
+function npcsClient.Startup()
+	
+	-- loop to move CFrames to tweened positions and keep npcs facing the right direction
+	RunService.RenderStepped:Connect(function()
+		removeDistant() -- remove//readd npcs based on distance
+		
+		-- check if there is npc data
+		if not currentNpcData then
+			print("no npc data")
+		end
+		
+		-- go through npc data
+		local deadIDs = {}
+		for _, data in pairs(currentNpcData) do
+			local id = data.id
+			
+			-- check alive state
+			if data.dead then
+				table.insert(deadIDs, id)
+				continue
+			end
+			
+			if not characters[id] then continue end
+			
+			-- get character of npc id
+			local character = characters[id].character
+			local root = characters[id].root
+			local humanoid = characters[id].humanoid
+			local tracks = characters[id].tracks
+
+			-- make variables for stored functions
+			local trackConflicts = characters[id].trackConflicts
+			local stopIdle = characters[id].stopIdle
+			local stopWalk = characters[id].stopWalk
+
+			-- check if character exists and has a humanoid
+			if not character or not humanoid then continue end
+
+			if data.velocity.Magnitude > 0.1 then
+
+				-- create a smoothed direction using lerp from current to target
+				local targetDirection = data.velocity.Unit
+				local currentDirection = root.CFrame.LookVector
+				local smoothedDirection = currentDirection:Lerp(targetDirection, 0.1)
+
+				-- recreate position to use the direct Y level rather than tweened one
+				--root.Position = Vector3.new(
+				--	root.Position.X, 
+				--	data.position.Y + 2.3, -- original Y position direct from server + offset
+				--	root.Position.Z
+				--)
+
+				-- place CFrame at tweened positions and look at the target direction
+				root.CFrame = CFrame.lookAt(root.Position, root.Position + smoothedDirection) -- look direction
+
+				-- walking
+				if not trackConflicts(tracks.walkTrack) then
+					stopIdle()
+					characters[id].nextTrack = tracks.walkTrack
+				end
+			end
+
+			-- animate
+			-- play tool active if attack counter increased from the previous frame
+			if data.attacks > characters[id].lastAttackCount then
+				characters[id].lastAttackCount = data.attacks -- set last attack count to current count
+				tracks.toolActiveTrack:Play()
+			end
+			
+			-- jumping state
+			if data.jumping then
+				-- stop walktrack if it's playing when the jump happens
+				if tracks.walkTrack.IsPlaying then 
+					tracks.walkTrack:Stop()
+				end
+				-- play jump track
+				stopIdle()
+				characters[id].nextTrack = tracks.jumpTrack
+			end
+
+			---- detect falling
+			--if humanoid:GetState() == Enum.HumanoidStateType.Freefall and characters[id].allowedJump then
+			--	stopIdle()
+			--	characters[id].nextTrack = tracks.fallTrack
+			--end
+
+			-- detect hitting ground
+			if humanoid:GetState() == Enum.HumanoidStateType.Landed then
+				tracks.jumpTrack:Stop()
+				tracks.fallTrack:Stop()
+			end
+
+			-- idle
+			if data.velocity.Magnitude < 0.1 then 
+				if not trackConflicts(tracks.idleTrack) then
+					stopWalk()
+					characters[id].nextTrack = tracks.idleTrack 
+				end
+			end
+
+			-- if new track is different from last track, set current track to new track and stop all other tracks
+			if characters[id].nextTrack ~= characters[id].currentTrack then
+				characters[id].currentTrack = characters[id].nextTrack 
+				characters[id].currentTrack:Play(0.1)
+			end
+		end
+		
+		-- cleanup dead npcs after the loop
+		clearDead(deadIDs)
+	end)
+end
+
+-- function to get id from character
+function npcsClient.getCharacterId(character)
+	for id, _ in pairs(characters) do
+		if characters[id].character == character then
+			return id
+		end
+	end
+end
+
+-- function to get distance from character
+function npcsClient.getCharacterPosition(id)
+	return characters[id].root.Position
+end
+
+return npcsClient
+

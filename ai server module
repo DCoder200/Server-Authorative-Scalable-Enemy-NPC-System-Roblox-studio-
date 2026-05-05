@@ -1,0 +1,880 @@
+-- modeulescript inside ServerScriptService
+-- requires models containing parts named "base" with npc tag
+-- config for the npc is stored within corresponding npc model inside replicated storage
+-- depends on client side builder module to render the npcs on the clients
+
+-- services
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+local AnimationClipProvider = game:GetService("AnimationClipProvider")
+
+-- setup reusable parameters for GetPartBoundsInBox
+local overlapParams = OverlapParams.new()
+overlapParams.FilterDescendantsInstances = {game.Workspace.World}  -- filter out player character and world, give local player a mob folder later for ghost npcs
+overlapParams.FilterType = Enum.RaycastFilterType.Exclude -- set filter type to exclude
+
+-- setup reusable raycast parameters
+local raycastResult -- set for scope
+
+-- parameters for traversing the world
+local raycastParamsTraverse = RaycastParams.new()
+raycastParamsTraverse.FilterDescendantsInstances = {game.Workspace.World}
+raycastParamsTraverse.FilterType = Enum.RaycastFilterType.Include
+
+-- parameters for line of sight checks
+local raycastParamsLOS = RaycastParams.new()
+raycastParamsLOS.FilterDescendantsInstances = {}
+raycastParamsLOS.FilterType = Enum.RaycastFilterType.Exclude
+
+-- remotes
+local npcUpdates = game.ReplicatedStorage.Remotes.npcUpdates
+
+-- models folders, these contain the config modules for the npcs and tools 
+local npcModels = game.ReplicatedStorage:WaitForChild("npcModels")
+local toolModels = game.ReplicatedStorage:WaitForChild("toolModels")
+
+-- id dictionaries
+local NPCs = {} -- store all tagged ids 
+local debounces = {} 
+local data = {} 
+local states = {}
+local movements = {} 
+local cachedResults = {} 
+local statistics = {}
+
+local debug = true -- set to true to generate visuals for points and extra prints
+local id = 1 -- make sure to start this at 1, 0th doesn't get visualised by clients for some reason
+
+-- function to add one npc
+local function addNPC(npcName, spawnPosition, spawnerID)
+	table.insert(NPCs, id) -- add id to npcs
+
+	-- retrieve config for npc (part name should match an npc name in replicated storage)
+	local config = require(npcModels:FindFirstChild(tostring(npcName)).config)
+
+	-- find model of tool in replicated storage 
+	local attackDuration = nil
+	local attackStart = nil
+
+	local toolModel 
+	if config.toolName then
+		toolModel = toolModels:FindFirstChild(config.toolName)
+	end
+
+	if toolModel then
+
+		-- find length of active animation
+		local active = toolModel.active.activeAnim
+		local clip = AnimationClipProvider:GetAnimationClipAsync(active.AnimationId)
+
+		local endTime = 0
+		local damageStart = 0
+		for i, keyframe in pairs(clip:GetKeyframes()) do
+
+			-- set end time to keyframe time if it's higher than previous
+			if keyframe.Time > endTime then
+				endTime = keyframe.Time
+			end
+
+			-- look for damage start marker
+			for _, marker in ipairs(keyframe:GetMarkers()) do
+				damageStart = keyframe.Time
+			end
+		end
+
+		attackDuration = endTime
+		attackStart = damageStart or 0 -- set to 0 if no damage start marker
+	end
+
+	-- set spawn position to npc base position if none is specified
+	if not spawnPosition then
+		spawnPosition = npcName.base.Position
+	end
+
+	-- populate id dictionaries
+	debounces[id] = { -- debounces matching function names
+		sight = 0, -- sight checks
+		computeDisperse = 0, -- disperse directions
+		pickTarget = 0, -- target picking
+		ground = 0, -- ground checks
+		stepCheck = 0, -- step checks
+		step = 0, -- steps themselves
+		disperseCooldown = math.random() * 1.5 + 2, -- randomised cooldown for disperse
+		pathingDelay = (0.05 + math.random() * 0.3), -- randomised 50–250 ms delay for pathing
+		attackCheck = 0, -- check if npc can attack
+		attack = 0, -- debounce for attack function
+		attackCooldown = 2, -- cooldown for attack function (changes based on tool)
+	}
+
+	-- previous results cache
+	cachedResults[id] = {
+		sight = false, -- boolean from last sight check
+		distance = false, -- result of last distance check
+		targetBool = false, -- boolean value from last target pick
+	}
+
+	-- per id data 
+	data[id] = {
+		id = id, -- assign fixed id 
+		modelName = config.modelName, -- model name to be sent to clients
+		toolName = config.toolName, -- weapon name to be sent to clients
+		waypoints = nil, -- waypoints for pathing
+		target = nil, -- per id target player 
+		attacks = 0, -- count attacks for clients
+		spawnerID = spawnerID, -- id of spawner npc is spawned from
+	}
+
+	-- values such as health and armour
+	statistics[id] = {
+		maxHealth = config.health,
+		health = config.health,
+		armour = config.armour
+	}
+
+	-- store states
+	states[id] = {
+		jumping = false, 
+		stepping = false, -- indicates npc is stepping up
+		steppingClear = false, -- locks steps from being stack cleared
+		makingPath = false, -- locks path creation requests
+		dead = false, -- indicator for clients to stop rendering npc
+		attackDuration = attackDuration, -- length of attack animation
+		attackStart = attackStart, -- timestamp of when an attack starts doing damage during an animation
+	}
+
+	-- id movement variables
+	movements[id] = {
+		position = spawnPosition, -- set to position of part initially
+		speed = config.walkspeed, -- 23 is roughly humanoid 16
+		direction = Vector3.zero, -- will be set to normalised (id position - target position)
+		velocity = Vector3.zero,
+		disperseDirection = Vector3.zero, -- used for disperse away from other id's
+		jumpHeight = config.jumpHeight,
+		lastDirection = nil -- store previous direction for frame to frame lerping
+	}
+
+	-- destroy base if there is one
+	if npcName.base then
+		npcName.base:Destroy()
+	end
+
+	id += 1
+end
+
+-- function to respawn a dead NPC
+local function respawnNPC(position, spawnerID)
+
+	-- find a dead id to respawn in NPCs dictionary
+	for _, id in pairs(NPCs) do
+		if states[id].dead then -- if npc is dead
+			statistics[id].health = statistics[id].maxHealth -- reset health
+			states[id].dead = false -- reset dead state
+			data[id].spawnerID = spawnerID -- set spawner id
+			movements[id].position = position -- set position
+			break -- don't respawn any more
+		end
+	end
+end
+
+-- function to clear data of an npc
+local spawnerCallback -- set scope for spawner callback
+local function clearID(id)
+
+	-- check if it belongs to a spawn zone
+	if data[id].spawnerID then
+
+		-- show which spawner npc belonged to 
+		if debug then
+			print("belonged to spawner:", data[id].spawnerID)
+		end
+
+		-- call callback for spawner to update its population count
+		if spawnerCallback then
+			spawnerCallback(data[id].spawnerID)
+		end
+
+		-- clear spawner data for id
+		data[id].spawnerID = nil
+	end
+end
+
+-- function to check distance between ids, pass id using it in so it can ignore itself
+local function computeDisperse(id)
+	if tick() - debounces[id].computeDisperse <= debounces[id].disperseCooldown then return end -- debounce
+	debounces[id].computeDisperse = tick() -- set last use to current time
+
+	local sumDirections = Vector3.zero -- used to store sum of opposite directions from each close id
+
+	-- check distance from each id
+	for _, otherID in pairs(NPCs) do -- make sure to not call it "id" again
+		if states[otherID].dead then continue end
+
+		-- if it exists and isn't the same id
+		if otherID and otherID ~= id then 
+			local distance = (movements[otherID].position - movements[otherID].position).Magnitude -- distance between root parts
+
+			-- only take into account if close enough
+			if distance <= 50 then
+				local weight = 1 / math.max(distance, 0.1) -- inverse distance weighting formula, won't turn negative and gets very strong when close
+				local opposite = (movements[id].position - movements[otherID].position).Unit -- if this isn't the opposite already then multiply by -1
+
+				sumDirections += opposite * weight -- add opposite direction to sum
+			end
+		end
+	end
+
+	-- check if sum of opposite directions is not 0
+	if sumDirections ~= Vector3.zero then
+		local offset = Vector3.new((math.random() - 0.5) * 0.3, 0, (math.random() - 0.5) * 0.3) -- offset X and Z of direction by a random amount
+		local finalDirection = (sumDirections + offset).Unit -- normalise and add offset
+
+		-- raycast in direction to check it's clear
+		local raycast = workspace:Raycast(
+			movements[id].position, 
+			finalDirection * 10, -- 10 studs in disperse direction
+			raycastParamsTraverse)
+
+		-- if there's no obstacle in the direction
+		if not raycast then 
+			movements[id].disperseDirection = finalDirection -- set disperse direction
+		else -- set disperse direction to nothing if there's an obstacle 
+			movements[id].disperseDirection = Vector3.zero 
+		end
+
+	else -- it's 0, no id's were close enough
+		movements[id].disperseDirection = Vector3.zero-- set opposite direction to nothing if no id's were close enough
+	end
+end
+
+-- compute path function
+local function computePath(id)
+
+	-- get target and make sure it's still present, this can be an issue if target is gone but there's still a delayed request coming in to the function
+	local target = data[id].target
+	if not target then return end
+
+	-- path variable
+	local path = PathfindingService:CreatePath({
+		AgentCanJump = true, 
+		AgentJumpHeight = 3, 
+		WaypointSpacing = 5,
+		AgentRadius = 5}) -- make id slightly bigger for pathfinding to reduce collisions
+
+	-- wrap the path computation in a pcall to catch errors
+	local success = pcall(function() 
+		path:ComputeAsync(movements[id].position, target.Position) 
+	end)
+
+	-- if function fails
+	if not success then 
+		warn("Failed to compute path")
+	else
+		--print("Path computed") 
+		local waypointsDirty = path:GetWaypoints() -- calls a method that gets all waypoints from the path (consists of position and mode)
+
+		if #waypointsDirty > 1 then -- remove first waypoint if it contains more than 1 waypoint
+			table.remove(waypointsDirty, 1)
+		end
+
+		-- root out waypoints that are too close together before returning them
+		local waypoints = {} -- convert to table
+		for i, waypoint in pairs(waypointsDirty) do
+
+			-- if there is a next waypoint
+			if waypointsDirty[i + 1] then
+				if not((waypoint.Position - waypointsDirty[i + 1].Position).Magnitude <= 3) then -- if the distance between the current and next waypoint is less than 3
+					table.insert(waypoints, waypoint) -- insert it 
+				end
+
+			else
+				table.insert(waypoints, waypoint) -- if there isn't a waypoint after it, insert it
+			end
+		end	
+		--print("Computed path")
+
+		data[id].waypoints = waypoints -- set id's waypoints to computed waypoints
+		states[id].makingPath = false -- allow further paths to be made in the main loop, make sure this is after the waypoints are set
+	end
+end
+
+-- check if a new path is required
+local function pathNeeded(id)
+	local waypoints = data[id].waypoints -- set waypoints variable to id's waypoints
+	local target = data[id].target
+
+	-- check they exist and contain at least 1 waypoint
+	if not waypoints or #waypoints == 0 then
+		return true -- if there are no waypoints or the length is 0
+
+	else -- if there are waypoints
+		if target and (waypoints[#waypoints].Position - target.Position).Magnitude > 30 then
+			return true -- if the distance between the last waypoint and player is more than 30
+
+		else -- there are valid waypoints already
+			return false 
+		end
+	end
+end
+
+-- raycast result return for one source of truth as to whether enemy has LOS of player
+local function sight(id, target)
+	if not target then -- debounce only if argument was not passed
+		if (tick() - debounces[id].sight) <= 0.25 then -- debounce to prevent raycast spam
+			return cachedResults[id].sight
+		end
+	end
+
+	debounces[id].sight = tick()
+	target = data[id].target or target -- set target variable to id's target player or target if one was passed
+
+	-- raycast to player
+	if target then 
+		local rayOrigin = movements[id].position 
+		local rayTarget = target.Position -- object it's looking for
+		local direction = rayTarget - rayOrigin -- set direction of ray
+		raycastResult = workspace:Raycast(rayOrigin, direction, raycastParamsLOS) -- result of raycast
+	end
+
+	-- detect if it hits the player
+	if raycastResult and target then 
+		if raycastResult.Instance:IsDescendantOf(target.Parent) then -- if it's a child of the player
+			--print("seeing player")
+			cachedResults[id].sight = true
+			return true 
+
+		else -- if no player is in sight
+			--print("seeing nothing")
+			cachedResults[id].sight = false
+			return false
+		end
+	end
+end
+
+-- raycast to ground to stop id from floating
+local function ground(id)
+	if states[id].stepping then return end -- only ground if id isn't stepping
+
+	-- apply debounce if id isn't jumping
+	if not states[id].jumping then
+		if tick() - debounces[id].ground <= 0.1 then return end
+	end
+	debounces[id].ground = tick()
+
+	local raycast = workspace:Raycast(
+		(movements[id].position + (movements[id].velocity * 0.1) + Vector3.new(0, 10, 0)), -- origin above id
+		Vector3.new(0, -25, 0), -- destination direction going down
+		raycastParamsTraverse -- parameters
+	)
+
+	if raycast then
+
+		-- move id position to the ground
+		movements[id].position = Vector3.new(
+			movements[id].position.X, 
+			(raycast.Position.Y + 0.7), 
+			movements[id].position.Z
+		)
+	end
+end
+
+-- function to simulate a jump
+local function jump(id, deltaTime)
+	if states[id].jumping then return end -- stop jumps from stacking
+	states[id].jumping = true
+
+	task.wait(0.25) -- wait a little as jumps are almost always called early
+
+	-- move id position upwards
+	movements[id].position += Vector3.new(0, 10, 0)
+
+	task.wait(0.5)
+
+	-- place id back onto the ground
+	ground(id)
+
+	states[id].jumping = false
+end
+
+-- function to raycast ahead from a specific Y position, used twice for stepping
+local function castAhead(id, height)
+	local origin = movements[id].position + Vector3.new(0, height, 0) -- origin slightly above position (where feet would be)
+
+	local direction = movements[id].direction * 2 -- destination 2 studs ahead in direction
+	if direction.Magnitude > 0 then -- make sure it's not 0
+		local raycast = workspace:Raycast(
+			origin,
+			movements[id].direction * 3, -- destination 2 studs ahead in direction
+			raycastParamsTraverse -- parameters
+		)
+
+		return raycast
+	end
+end
+
+-- function to step up, will automatically jump if an obstacle is too tall
+local function stepCheck(id)
+	if tick() - debounces[id].stepCheck <= 0.1 then return end -- debounce
+	debounces[id].stepCheck = tick()
+
+	-- perform a short raycast foward ahead of feet
+	local raycast_1 = castAhead(id, 1) -- check for obstacles infront and 1 stud above feet 
+
+	if raycast_1 then -- if it hit an obstacle try a 2nd ray from higher up
+
+		-- cast a 2nd ray ahead to see if we can step up
+		local raycast_2 = castAhead(id, 1.5)
+
+		if not raycast_2 then -- if obstacle is short enough to step up
+			if tick() - debounces[id].step <= 0.25 then return end -- debounce steps directly
+			debounces[id].step = tick()
+			states[id].stepping = true -- set stepping to true
+
+			movements[id].position += Vector3.new(0, 1.5, 0) -- add 1 to Y position
+
+		else -- see if jumping is possible with a third raycast
+			local raycast_3 = castAhead(id, 7.5)
+			if not raycast_3 then 
+				jump(id, 0.25)
+
+			else -- if jumping is not possible
+				print("should not jump")
+			end
+		end
+	end
+
+	-- set state to false on a delay if it's at true
+	if states[id].stepping then
+
+		if not states[id].steppingClear then
+			states[id].steppingClear = true -- prevent stacking of stepping clears
+
+			task.delay(0.15, function()
+				states[id].steppingClear = false -- allow further clears
+				states[id].stepping = false
+			end)
+		end
+	end
+end
+
+-- function to find nearest player to id
+local aggroRange = 100 -- set range that ids will aggro
+local function pickTarget(id)
+	if tick() - debounces[id].pickTarget <= 1 then 
+		return cachedResults[id].targetBool -- return previous return boolean
+	end
+
+	debounces[id].pickTarget = tick()
+
+	-- set initial target to be first player
+	local closestTarget
+	local closestDistance = math.huge
+
+	-- check distance magnitude to all players
+	for _, player in ipairs(Players:GetPlayers()) do
+
+		-- move on to the next player if player has no character or is dead
+		if not player.Character or not player.Character.Humanoid or player.Character.Humanoid.Health <= 0 then continue end
+
+		-- get distance from root to target
+		local target = player.Character:FindFirstChild("HumanoidRootPart")
+		local distance = (movements[id].position - target.Position).Magnitude
+
+		-- compare distance to current closest distance and set new closest target if it's closer than the current closest target
+		if distance < closestDistance then
+
+			-- if there is no target set yet then check LOS to target
+			if not data[id].target then
+				if sight(id, target) then
+					closestTarget = target
+					closestDistance = distance
+				end
+			else -- if there already is a target don't stop chasing when LOS is lost
+				closestTarget = target
+				closestDistance = distance
+			end
+		end
+	end
+
+	-- return target if it's within 50 studs distance 
+	if closestDistance <= aggroRange then
+		data[id].target = closestTarget -- set id target
+		cachedResults[id].targetBool = true
+
+		return true -- indicate there's a target
+
+	else -- clear and indicate there is no target
+		data[id].target = nil
+		cachedResults[id].targetBool = false
+
+		return false -- indicate there isn't a target
+	end
+end
+
+-- function to check distance from player
+local function distanceCheck(id, minDistance, maxDistance)	
+	local target = data[id].target -- set target variable to id's target player
+
+	-- set default values
+	local minDistance = minDistance or 2.5
+	local maxDistance = maxDistance or 10
+
+	-- move if more than 10 studs away from target
+	if (movements[id].position - target.Position).Magnitude >= 10 then 
+		cachedResults[id].distance = true
+		return true
+
+		-- stop moving if within 5 studs
+	elseif (movements[id].position - target.Position).Magnitude <= 5 then 
+		cachedResults[id].distance = false
+		return false
+
+	else -- return previous return boolean if distance is somewhere in-between those thresholds 
+		return cachedResults[id].distance
+	end
+end
+
+-- function to set direction 
+-- TODO FIX BROKEN DISPERSE
+local disperseWeight = 5 -- extra weight to disperse directions, too low seems to not have enough of an affect to keep them apart
+local function setDirection(id, target)
+	if not target then return end
+
+	local direction = (target.Position - movements[id].position) -- direction from id to target
+	direction += (movements[id].disperseDirection * disperseWeight) -- add disperse direction
+	direction = direction.Unit
+
+	-- lerp between last direction and new direction
+	if movements[id].lastDirection then -- make sure to normalise before lerping
+		direction = movements[id].lastDirection:Lerp(direction, 0.1)
+	end
+
+	movements[id].direction = Vector3.new(direction.X, 0, direction.Z).Unit -- set direction to be in the X and Z only then normalise it 
+	movements[id].lastDirection = movements[id].direction -- set last direction to be the current direction
+end
+
+-- function to set id's velocity
+local function setVelocity(id)
+	local velocity = movements[id].direction * movements[id].speed -- get velocity from multiplying direction by speed
+	movements[id].velocity = velocity -- set id velocity
+end
+
+-- function to move id in a direction
+local function move(id, deltaTime)
+	setVelocity(id)
+
+	local velocity = movements[id].velocity -- get velocity
+
+	-- change position based on velocity
+	movements[id].position += velocity * deltaTime
+end
+
+-- function to create table for clients
+local function sendClientData()
+
+	-- send data per player
+	for _, player in pairs(game.Players:GetPlayers()) do
+		local clientData = {} -- clear table for each player
+
+		local character = player.Character
+		if not character then continue end -- make sure player has a character
+
+		local root = character:FindFirstChild("HumanoidRootPart")
+		if not root then continue end -- make sure player has a root part
+
+		-- go through ids
+		for _, id in pairs(NPCs) do
+			if not movements[id] then continue end
+
+			-- add id to data if it is close enough for the player to see
+			local distance = (root.Position - movements[id].position).Magnitude
+			if distance <= 200 then
+
+				-- send data as an array because arrays stay intact after serialisation
+				table.insert(clientData, {
+					id = id, -- id of npc
+					modelName = data[id].modelName,
+					toolName = data[id].toolName,
+					position = movements[id].position,
+					velocity = movements[id].velocity,
+					direction = movements[id].direction,
+					jumping = states[id].jumping,
+					dead = states[id].dead,
+					attacks = data[id].attacks
+				})
+			end
+		end
+
+		-- send relevant data to player
+		npcUpdates:FireClient(player, clientData)
+	end
+end
+
+-- function to attack
+local damageCallback -- set callback variable for scope
+local function attack(id)
+	if tick() - debounces[id].attack <= debounces[id].attackCooldown then return end
+	debounces[id].attack = tick()
+
+	-- add to attacks counter for clients
+	data[id].attacks += 1
+
+	-- loop until 2 seconds pass
+	local startTime = tick()
+	while tick() - startTime < states[id].attackDuration do
+		task.wait(0.01)
+
+		-- start hitting at attackStart animation event timestamp
+		if tick() - startTime >= states[id].attackStart then
+
+			-- create a bound box region infront of the npc
+			local position = movements[id].position + movements[id].direction * 5
+
+			-- convert to cframe
+			local center = CFrame.new(position)
+			local size = Vector3.new(2.5, 5, 2.5)
+
+			-- check for parts in box
+			local result = game.Workspace:GetPartBoundsInBox(
+				center, --* offset, -- center
+				size,--Vector3.new(5.5, 1, 1), -- size
+				overlapParams -- set overlap parameters argument as the variable you made for it
+			) 
+
+			-- spawn visual 
+			if debug then
+				local attackPart = Instance.new("Part")
+				attackPart.Size = size
+				attackPart.Color = Color3.new(1, 0, 0) -- red
+				attackPart.Material = Enum.Material.ForceField
+				attackPart.CFrame = center
+				attackPart.Anchored = true
+				attackPart.CanCollide = false
+				attackPart.CanQuery = false
+				attackPart.Transparency = 0.5
+				attackPart.Parent = workspace
+				game.Debris:AddItem(attackPart, 1)
+			end
+
+			-- check for result
+			if result then
+				for _, part in ipairs(result) do
+
+					-- check if part is a model
+					local character = part.Parent
+					if not character:IsA("Model") then return end
+
+					-- look for humanoid
+					local humanoid = part.Parent:FindFirstChild("Humanoid")
+					if not humanoid then return end
+
+					-- apply damage using callback that links back to the damage module
+					if damageCallback then
+						damageCallback(character, 20)
+					end
+				end
+			end	
+		end
+	end
+end
+
+-- function to check if an attack should be triggered
+local function attackCheck(id)
+	if not data[id].toolName then return end -- must have a tool
+
+	-- debounce
+	if tick() - debounces[id].attackCheck <= 0.5 then return end
+	debounces[id].attackCheck = tick()
+
+	if not sight(id) then return end -- must have LOS
+	--if not distanceCheck(id, 0, 5) then return end -- must be within range
+
+	if (data[id].target.Position - movements[id].position).Magnitude >= 10 then return end
+
+	-- if all conditions passed then attack
+	attack(id)
+end
+
+-- module functions
+local npcManager = {} 
+function npcManager.Startup()
+
+	-- get all initial tagged NPCs and set them up 
+	for _, npc in pairs(CollectionService:GetTagged("npc")) do
+		addNPC(npc)
+	end
+
+	-- loop that updates all ids
+	local accumulator60 = 0
+	local interval60 = 1/60 -- 60 fps interval
+
+	local accumulator10 = 0
+	local interval10 = 1/10 -- 10 fps interval
+	RunService.Heartbeat:Connect(function(deltaTime)
+
+		-- 60 fps debounce for main id loop
+		accumulator60 += deltaTime
+		if accumulator60 < interval60 then return end
+		accumulator60 = 0
+
+		-- update each id
+		for _, id in pairs(NPCs) do
+			if not table.find(NPCs, id) then continue end
+			if not statistics[id] then continue end
+
+			-- queue dead ids for clearing later
+			if statistics[id].health <= 0 then
+				states[id].dead = true
+				clearID(id)
+				continue 
+			end
+
+			-- pick target and skip id if there isn't one
+			if not pickTarget(id) then 
+				movements[id].velocity = Vector3.zero -- set velocity to 0 if there is no target
+				continue 
+			end -- set target, and indicate if one was set
+			
+			attackCheck(id) -- check if it is time to attack
+
+			-- do the same thing with distance check
+			if not distanceCheck(id) then 
+				movements[id].velocity = Vector3.zero -- set velocity to 0 since it is within 5 studs
+				continue 
+			end -- move on to the next loop iteration
+
+			-- make sure id isn't floating if it's not mid-jump
+			if not states[id].jumping then
+				ground(id) 
+				stepCheck(id)
+			end
+
+			computeDisperse(id) -- calculate a disperse direction for id, will set data[id].disperseDirection which is added to directions
+
+			-- if id sees target
+			if sight(id) then
+				setDirection(id, data[id].target) -- set direction towards player
+				data[id].waypoints = nil -- set waypoints of id to nil since it sees target
+
+			else -- pathfinding mode
+				if pathNeeded(id) then
+					if not states[id].makingPath then
+						states[id].makingPath = true -- lock making path
+
+						-- create path with randomised delay
+						task.delay(debounces[id].pathingDelay, function()
+							computePath(id)
+						end)
+					end
+				end
+
+				local waypoints = data[id].waypoints -- set local variable to simplify code
+
+				-- loop that will run while waypoints exist
+				if waypoints and #waypoints > 0 then
+					setDirection(id, data[id].waypoints[1]) -- set direction towards next waypoint
+
+					-- next waypoint will always be 1 as reached waypoints are removed 
+					local distance = (waypoints[1].Position - movements[id].position).Magnitude 
+
+					-- compare waypoint altitude to id position, if waypoint is higher then id will jump
+					if waypoints[1].Position.Y > movements[id].position.Y + 5 and distance < 10 then 
+						jump(id, deltaTime)
+					end
+
+					-- remove waypoint once reached DO NOT SET BELOW THIS VALUE, will most likely not detect in time
+					if distance <= 5 then 
+						if data[id].waypoints and #data[id].waypoints > 0 then
+							table.remove(data[id].waypoints, 1) 
+						end
+					end	
+				end
+			end
+
+			-- move id in whatever direction has been set, good for preventing stalling if waypoints haven't been set yet aswell
+			if not states[id].dead then
+				move(id, deltaTime)
+			end
+		end
+
+		-- 10 fps debounce for sending data to clients 
+		accumulator10 += deltaTime
+		if accumulator10 > interval10 then 
+			accumulator10 = 0
+
+			-- spawn visual blocks for debugging
+			if debug then
+				for _, id in pairs(NPCs) do
+					if not states[id] then continue end
+					if states[id].dead then continue end
+
+					local part = Instance.new("Part")
+					part.Size = Vector3.new(1,1,1)
+					part.Position = movements[id].position
+					part.Anchored = true
+					part.CanQuery = false
+					part.CanCollide = false
+					part.Parent = workspace
+					game.Debris:AddItem(part, 1)
+				end
+			end
+
+			-- send data 
+			sendClientData()
+		end	
+	end)
+
+	-- function to return total alive npcs
+	function npcManager.getAlive()
+		local alive = 0
+		for _, id in pairs(NPCs) do
+			if states[id].dead then continue end
+
+			alive += 1
+		end
+
+		return alive
+	end
+
+	-- function to add an npc
+	function npcManager.spawnNPC(npcName, position, spawnerID)
+
+		-- check if there are available dead NPCs to reuse
+		if npcManager.getAlive() < #NPCs then
+			respawnNPC(position, spawnerID)
+		else -- if not, add a new one
+			addNPC(npcName, position, spawnerID)
+		end
+	end
+
+	-- function to get position of an id
+	function npcManager.getPosition(id)
+		if not movements[id] then return end
+		return movements[id].position
+	end
+
+	-- function to hurt npc
+	function npcManager.damageNPC(id, damage)
+		if not statistics[id] then return end
+		statistics[id].health -= damage
+	end
+
+	-- accept callback from damage module to apply damage to players
+	function npcManager.inputDamageCallback(callback)
+		damageCallback = callback
+	end
+
+	-- accept callback from spawner module, this is to tell the spawner that it can spawn a new npc if an npc dies
+	function npcManager.inputSpawnerCallback(callback)
+		spawnerCallback = callback
+	end
+
+	-- test function to see if a script can access the module functions
+	function npcManager.test()
+		print("test")
+	end
+end
+
+return npcManager
+

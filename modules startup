@@ -1,0 +1,12 @@
+-- require both modules
+local npcManager = require(game.ServerScriptService.Modules.npcManager)
+local doDamage = require(game.ServerScriptService.Modules.doDamage)
+local npcSpawner = require(game.ServerScriptService.Modules.npcSpawner)
+
+-- startup AI and spawning module
+npcManager.Startup()
+npcSpawner.Startup()
+
+-- input damage callback into npc manager, make sure to do this after startup or it breaks
+npcManager.inputDamageCallback(doDamage.Validate)
+npcManager.inputSpawnerCallback(npcSpawner.subtractCount)

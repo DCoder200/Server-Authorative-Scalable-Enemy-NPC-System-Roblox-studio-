@@ -1,0 +1,78 @@
+-- modulescript inside ServerScriptService
+-- requires callback to track npc deaths
+-- services
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+
+-- main module table
+local npcSpawner = {}
+
+-- data for each spawner
+local data = {}
+
+-- toggle to destroy physical spawner parts
+local destroySpawns = false
+
+-- function to start spawning
+function npcSpawner.Startup()
+	
+	-- modules
+	local npcManager = require(game.ServerScriptService.Modules.npcManager)
+
+	-- setup data for each tagged spawner
+	local id = 1
+	for _, spawner in pairs(CollectionService:GetTagged("spawner")) do
+		data[id] = {
+			maxCount = 3,
+			currentCount = 0,
+			npcType = "normal_npc",
+
+			-- object properties
+			position = spawner.Position,
+			size = spawner.Size,
+		}
+
+		id += 1
+		
+		-- discard physical part
+		if destroySpawns then
+			spawner:Destroy()
+		end
+	end
+
+	-- poll npc population and decide whether to spawn more
+	local lastPoll = 0
+	RunService.Heartbeat:Connect(function()
+		if tick() - lastPoll <= 2 then return end
+		lastPoll = tick()
+
+		-- return if already at max population
+		if npcManager.getAlive() >= 1000 then return end
+
+		-- else spawn npcs
+		for id, _ in pairs(data) do
+			if data[id].currentCount >= data[id].maxCount then return end
+
+			-- pick a random X and Z within the plane bounds
+			local position = data[id].position -- get position of spawner
+			local size = data[id].size -- get size of spawner
+			local randomX = position.X + (math.random() - 0.5) * size.X -- random x position + random number - 0.5 x plane size of X axis
+			local randomZ = position.Z + (math.random() - 0.5) * size.Z -- random z position + random number - 0.5 x plane size of Z axis
+
+			-- set random position from random X and Z with fixed Y 
+			local randomPosition = Vector3.new(randomX, position.Y, randomZ)
+
+			npcManager.spawnNPC(data[id].npcType, randomPosition, id)
+			data[id].currentCount += 1
+		end
+	end)
+end
+
+-- function to subtract 1 from the count of a spawner
+function npcSpawner.subtractCount(spawnerId)
+	if not data[spawnerId] then return end
+	data[spawnerId].currentCount -= 1
+end
+
+return npcSpawner
+

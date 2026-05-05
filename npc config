@@ -1,0 +1,10 @@
+return{
+	-- stats
+	walkspeed = 16, -- isn't 1:1 with humanoid walkspeed
+	jumpHeight = 10, -- in studs
+	health = 100,
+	armour = 0,
+
+	-- information
+	modelName = "normal_npc" -- sent to client to load the correct model from replicated storage
+}
