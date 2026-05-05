@@ -3,7 +3,7 @@ Fully server side enemy NPC AI management system with client side visuals sent t
 
 Supports pathfinding, dispersion and basic attacking behaviour. 
 
-Not recommended for production use as NPCs are still not fully stopped from passing through solid objects. And the jumping implementation is unpolished.
+Not recommended for production use as NPCs are still not fully stopped from passing through solid objects. And the jumping implementation is unpolished. Made to work specifically with my custom rig but can work for normal rigs with modifications.
 
 The main module will be completely redone using OOP when I get around to it.
 
